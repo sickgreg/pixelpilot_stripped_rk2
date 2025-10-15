@@ -250,12 +250,52 @@ static int commit_plane(VideoDecoder *vd, uint32_t fb_id, uint32_t src_w, uint32
         vd->src_h = src_h;
     }
 
+    uint32_t dst_w = vd->mode_w;
+    uint32_t dst_h = vd->mode_h;
+    uint32_t dst_x = 0;
+    uint32_t dst_y = 0;
+
+    if (src_w != 0 && src_h != 0) {
+        double mode_aspect = (double)vd->mode_w / (double)vd->mode_h;
+        double src_aspect = (double)src_w / (double)src_h;
+
+        if (mode_aspect > 0.0 && src_aspect > 0.0) {
+            if (src_aspect > mode_aspect) {
+                dst_w = vd->mode_w;
+                dst_h = (uint32_t)((double)vd->mode_w / src_aspect + 0.5);
+                if (dst_h > vd->mode_h) {
+                    dst_h = vd->mode_h;
+                }
+            } else {
+                dst_h = vd->mode_h;
+                dst_w = (uint32_t)((double)vd->mode_h * src_aspect + 0.5);
+                if (dst_w > vd->mode_w) {
+                    dst_w = vd->mode_w;
+                }
+            }
+        }
+    }
+
+    if (dst_w == 0) {
+        dst_w = 1;
+    }
+    if (dst_h == 0) {
+        dst_h = 1;
+    }
+
+    if (dst_w < vd->mode_w) {
+        dst_x = (vd->mode_w - dst_w) / 2;
+    }
+    if (dst_h < vd->mode_h) {
+        dst_y = (vd->mode_h - dst_h) / 2;
+    }
+
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_fb_id, fb_id);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_id, vd->crtc_id);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_x, 0);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_y, 0);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_w, vd->mode_w);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_h, vd->mode_h);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_x, dst_x);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_y, dst_y);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_w, dst_w);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_h, dst_h);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_src_x, 0);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_src_y, 0);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_src_w, (uint64_t)src_w << 16);
