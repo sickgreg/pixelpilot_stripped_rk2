@@ -1,6 +1,6 @@
-# PixelPilot Mini RK (Trimmed)
+# pixelpilot_stripped_rk
 
-This build keeps the essentials required to display an RTP/H.265 stream on a Rockchip DRM plane:
+pixelpilot_stripped_rk keeps the essentials required to display an RTP/H.265 stream on a Rockchip DRM plane:
 
 - DRM/KMS initialisation and plane management.
 - A custom UDP receiver feeding RTP packets into a small GStreamer pipeline.

@@ -241,7 +241,7 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     ps->stop_requested = FALSE;
     ps->encountered_error = FALSE;
 
-    GstElement *pipeline = gst_pipeline_new("pixelpilot");
+    GstElement *pipeline = gst_pipeline_new("pixelpilot_stripped_rk");
     CHECK_ELEM(pipeline, "pipeline");
 
     UdpReceiver *receiver = NULL;
