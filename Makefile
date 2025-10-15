@@ -90,7 +90,7 @@ LDFLAGS += -lpthread
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
-TARGET := pixelpilot_mini_rk
+TARGET := pixelpilot_stripped_rk
 
 all: $(TARGET)
 

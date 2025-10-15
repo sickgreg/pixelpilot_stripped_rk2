@@ -40,7 +40,7 @@ static void *pipeline_stop_worker(void *arg) {
     return NULL;
 }
 
-static const char *g_instance_pid_path = "/tmp/pixelpilot_mini_rk.pid";
+static const char *g_instance_pid_path = "/tmp/pixelpilot_stripped_rk.pid";
 
 static void remove_instance_pid(void) {
     if (unlink(g_instance_pid_path) != 0 && errno != ENOENT) {
@@ -117,7 +117,7 @@ static int ensure_single_instance(void) {
         if (existing_pid > 0) {
             errno = 0;
             if (kill(existing_pid, 0) == 0 || errno == EPERM) {
-                LOGE("An existing instance of pixelpilot_mini_rk is already running ... exiting ...");
+                LOGE("An existing instance of pixelpilot_stripped_rk is already running ... exiting ...");
                 return -1;
             }
         }

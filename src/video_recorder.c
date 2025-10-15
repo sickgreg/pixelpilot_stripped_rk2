@@ -89,7 +89,7 @@ static gchar *build_timestamped_output_path(const gchar *requested_path) {
 
     gchar *full_path = NULL;
     if (path_looks_like_directory(base_path)) {
-        gchar *filename = g_strdup_printf("pixelpilot-%s.mp4", timestamp);
+        gchar *filename = g_strdup_printf("pixelpilot_stripped_rk-%s.mp4", timestamp);
         full_path = g_build_filename(base_path, filename, NULL);
         g_free(filename);
     } else {
