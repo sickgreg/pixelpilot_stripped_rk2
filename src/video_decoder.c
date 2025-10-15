@@ -105,6 +105,14 @@ static inline guint64 get_time_ms(void) {
     return (guint64)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull;
 }
 
+static inline RK_S64 gst_pts_to_mpp_timestamp(GstClockTime pts) {
+    if (!GST_CLOCK_TIME_IS_VALID(pts)) {
+        return (RK_S64)get_time_ms();
+    }
+    guint64 ms = gst_util_uint64_scale(pts, 1, GST_MSECOND);
+    return (RK_S64)ms;
+}
+
 static inline void copy_packet_data(guint8 *dst, const guint8 *src, size_t size) {
 #if PIXELPILOT_NEON_AVAILABLE
     /*
@@ -657,7 +665,7 @@ void video_decoder_stop(VideoDecoder *vd) {
     }
 }
 
-int video_decoder_feed(VideoDecoder *vd, const guint8 *data, size_t size) {
+int video_decoder_feed(VideoDecoder *vd, const guint8 *data, size_t size, GstClockTime pts) {
     if (vd == NULL || !vd->running) {
         return -1;
     }
@@ -671,7 +679,9 @@ int video_decoder_feed(VideoDecoder *vd, const guint8 *data, size_t size) {
     mpp_packet_set_data(vd->packet, vd->packet_buf);
     mpp_packet_set_pos(vd->packet, vd->packet_buf);
     mpp_packet_set_length(vd->packet, size);
-    mpp_packet_set_pts(vd->packet, (RK_S64)get_time_ms());
+    RK_S64 packet_pts = gst_pts_to_mpp_timestamp(pts);
+    mpp_packet_set_pts(vd->packet, packet_pts);
+    mpp_packet_set_dts(vd->packet, packet_pts);
 
     while (vd->running) {
         MPP_RET ret = vd->mpi->decode_put_packet(vd->ctx, vd->packet);

@@ -6,6 +6,7 @@
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <gst/app/gstappsink.h>
+#include <gst/gst.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,8 +24,7 @@
 #endif
 
 struct PendingSample {
-    guint8 *data;
-    size_t size;
+    GstBuffer *buffer;
     GstClockTime pts;
     GstClockTime duration;
     gboolean valid;
@@ -151,8 +151,8 @@ static void pending_reset(struct PendingSample *pending) {
     if (pending == NULL) {
         return;
     }
-    if (pending->data != NULL) {
-        g_free(pending->data);
+    if (pending->buffer != NULL) {
+        gst_buffer_unref(pending->buffer);
     }
     memset(pending, 0, sizeof(*pending));
 }
@@ -246,18 +246,33 @@ static void emit_pending(VideoRecorder *rec, guint32 duration_90k) {
         return;
     }
 
-    if (rec->pending.size == 0 || rec->pending.data == NULL) {
+    if (rec->pending.buffer == NULL) {
         pending_reset(&rec->pending);
         return;
     }
 
-    if (rec->pending.size > (size_t)INT_MAX) {
-        LOGW("minimp4: dropping oversized access unit (%zu bytes)", rec->pending.size);
+    gsize pending_size = gst_buffer_get_size(rec->pending.buffer);
+    if (pending_size == 0) {
         pending_reset(&rec->pending);
         return;
     }
 
-    int err = mp4_h26x_write_nal(&rec->writer, rec->pending.data, (int)rec->pending.size, duration_90k);
+    if (pending_size > (gsize)INT_MAX) {
+        LOGW("minimp4: dropping oversized access unit (%" G_GSIZE_FORMAT " bytes)", pending_size);
+        pending_reset(&rec->pending);
+        return;
+    }
+
+    GstMapInfo map;
+    if (!gst_buffer_map(rec->pending.buffer, &map, GST_MAP_READ)) {
+        LOGW("record: failed to map buffer for write (%" G_GSIZE_FORMAT " bytes)", pending_size);
+        pending_reset(&rec->pending);
+        return;
+    }
+
+    gsize copy_size = MIN(map.size, pending_size);
+    int err = mp4_h26x_write_nal(&rec->writer, map.data, (int)copy_size, duration_90k);
+    gst_buffer_unmap(rec->pending.buffer, &map);
     if (err == MP4E_STATUS_BAD_ARGUMENTS) {
         if (!rec->awaiting_sync_warning) {
             LOGI("record: waiting for VPS/SPS/PPS+IDR before writing MP4; dropping frame");
@@ -360,8 +375,12 @@ VideoRecorder *video_recorder_new(const RecordCfg *cfg) {
     return rec;
 }
 
-void video_recorder_handle_sample(VideoRecorder *rec, GstSample *sample, const guint8 *data, size_t size) {
-    if (rec == NULL || !rec->enabled || rec->failed || data == NULL || size == 0) {
+void video_recorder_handle_sample(VideoRecorder *rec, GstSample *sample, GstBuffer *buffer, const guint8 *data, size_t size) {
+    if (rec == NULL || !rec->enabled || rec->failed) {
+        return;
+    }
+
+    if (buffer == NULL && (data == NULL || size == 0)) {
         return;
     }
 
@@ -369,22 +388,18 @@ void video_recorder_handle_sample(VideoRecorder *rec, GstSample *sample, const g
         return;
     }
 
-    guint8 *copy = (guint8 *)g_malloc(size);
-    if (copy == NULL) {
-        LOGE("record: failed to allocate buffer for copy (%zu bytes)", size);
-        return;
-    }
-    memcpy(copy, data, size);
-
     GstClockTime pts = GST_CLOCK_TIME_NONE;
     GstClockTime duration = GST_CLOCK_TIME_NONE;
-    GstBuffer *buffer = sample != NULL ? gst_sample_get_buffer(sample) : NULL;
-    if (buffer != NULL) {
-        pts = GST_BUFFER_PTS(buffer);
+    GstBuffer *timestamp_buffer = buffer;
+    if (timestamp_buffer == NULL && sample != NULL) {
+        timestamp_buffer = gst_sample_get_buffer(sample);
+    }
+    if (timestamp_buffer != NULL) {
+        pts = GST_BUFFER_PTS(timestamp_buffer);
         if (!GST_CLOCK_TIME_IS_VALID(pts)) {
-            pts = GST_BUFFER_DTS(buffer);
+            pts = GST_BUFFER_DTS(timestamp_buffer);
         }
-        duration = GST_BUFFER_DURATION(buffer);
+        duration = GST_BUFFER_DURATION(timestamp_buffer);
     }
 
     if (rec->pending.valid) {
@@ -392,8 +407,32 @@ void video_recorder_handle_sample(VideoRecorder *rec, GstSample *sample, const g
         emit_pending(rec, dur90k);
     }
 
-    rec->pending.data = copy;
-    rec->pending.size = size;
+    GstBuffer *pending_buffer = NULL;
+    if (buffer != NULL) {
+        pending_buffer = gst_buffer_ref(buffer);
+    } else if (data != NULL && size > 0) {
+        GstBuffer *tmp = gst_buffer_new_allocate(NULL, (gsize)size, NULL);
+        if (tmp == NULL) {
+            LOGE("record: failed to allocate GstBuffer (%zu bytes)", size);
+            return;
+        }
+        GstMapInfo map;
+        if (!gst_buffer_map(tmp, &map, GST_MAP_WRITE)) {
+            LOGE("record: failed to map GstBuffer for copy (%zu bytes)", size);
+            gst_buffer_unref(tmp);
+            return;
+        }
+        memcpy(map.data, data, size);
+        gst_buffer_unmap(tmp, &map);
+        gst_buffer_set_size(tmp, (gsize)size);
+        pending_buffer = tmp;
+    }
+
+    if (pending_buffer == NULL) {
+        return;
+    }
+
+    rec->pending.buffer = pending_buffer;
     rec->pending.pts = pts;
     rec->pending.duration = duration;
     rec->pending.valid = TRUE;

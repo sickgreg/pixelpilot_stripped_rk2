@@ -112,18 +112,23 @@ static gpointer appsink_thread_func(gpointer data) {
         }
 
         GstBuffer *buffer = gst_sample_get_buffer(sample);
+        GstClockTime pts = GST_CLOCK_TIME_NONE;
         if (buffer != NULL) {
+            pts = GST_BUFFER_PTS(buffer);
+            if (!GST_CLOCK_TIME_IS_VALID(pts)) {
+                pts = GST_BUFFER_DTS(buffer);
+            }
             GstMapInfo map;
             if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
                 if (map.size > 0 && map.size <= max_packet) {
                     g_mutex_lock(&ps->recorder_lock);
                     VideoRecorder *recorder = ps->recorder;
                     if (recorder != NULL) {
-                        video_recorder_handle_sample(recorder, sample, map.data, map.size);
+                        video_recorder_handle_sample(recorder, sample, buffer, map.data, map.size);
                     }
                     g_mutex_unlock(&ps->recorder_lock);
 
-                    if (video_decoder_feed(ps->decoder, map.data, map.size) != 0) {
+                    if (video_decoder_feed(ps->decoder, map.data, map.size, pts) != 0) {
                         LOGV("Video decoder feed busy; retrying");
                     }
                 }

@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <gst/gst.h>
+
 #include "config.h"
 #include "drm_modeset.h"
 
@@ -19,7 +21,7 @@ void video_decoder_deinit(VideoDecoder *vd);
 int video_decoder_start(VideoDecoder *vd);
 void video_decoder_stop(VideoDecoder *vd);
 
-int video_decoder_feed(VideoDecoder *vd, const guint8 *data, size_t size);
+int video_decoder_feed(VideoDecoder *vd, const guint8 *data, size_t size, GstClockTime pts);
 void video_decoder_send_eos(VideoDecoder *vd);
 
 size_t video_decoder_max_packet_size(const VideoDecoder *vd);
