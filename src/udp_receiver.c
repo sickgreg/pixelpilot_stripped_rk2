@@ -28,7 +28,49 @@ struct UdpReceiver {
     GMutex lock;
     gboolean running;
     gboolean stop_requested;
+    GstBufferPool *pool;
+    gboolean pool_active;
 };
+
+static gboolean ensure_buffer_pool(UdpReceiver *ur) {
+    if (ur == NULL) {
+        return FALSE;
+    }
+
+    if (ur->pool != NULL) {
+        if (!ur->pool_active) {
+            if (!gst_buffer_pool_set_active(ur->pool, TRUE)) {
+                LOGW("UDP receiver: failed to activate buffer pool");
+                return FALSE;
+            }
+            ur->pool_active = TRUE;
+        }
+        return TRUE;
+    }
+
+    GstBufferPool *pool = gst_buffer_pool_new();
+    if (pool == NULL) {
+        LOGW("UDP receiver: failed to create buffer pool");
+        return FALSE;
+    }
+
+    GstStructure *config = gst_buffer_pool_get_config(pool);
+    gst_buffer_pool_config_set_params(config, NULL, UDP_MAX_PACKET, 8, 32);
+    if (!gst_buffer_pool_set_config(pool, config)) {
+        LOGW("UDP receiver: failed to configure buffer pool");
+        gst_object_unref(pool);
+        return FALSE;
+    }
+    if (!gst_buffer_pool_set_active(pool, TRUE)) {
+        LOGW("UDP receiver: failed to activate buffer pool");
+        gst_object_unref(pool);
+        return FALSE;
+    }
+
+    ur->pool = pool;
+    ur->pool_active = TRUE;
+    return TRUE;
+}
 
 static gboolean payload_type_matches(const guint8 *data, gssize len, int expected_pt) {
     if (expected_pt < 0) {
@@ -72,15 +114,33 @@ static gpointer receiver_thread(gpointer data) {
             continue;
         }
 
-        GstBuffer *gst_buf = gst_buffer_new_allocate(NULL, (gsize)n, NULL);
+        GstBuffer *gst_buf = NULL;
+        if (ensure_buffer_pool(ur)) {
+            GstFlowReturn acquire_ret = gst_buffer_pool_acquire_buffer(ur->pool, &gst_buf, NULL);
+            if (acquire_ret != GST_FLOW_OK) {
+                LOGW("UDP receiver: buffer pool acquisition failed: %s", gst_flow_get_name(acquire_ret));
+                gst_buf = NULL;
+            }
+        }
         if (gst_buf == NULL) {
-            LOGW("UDP receiver: dropping packet (allocation failed)");
-            continue;
+            gst_buf = gst_buffer_new_allocate(NULL, (gsize)n, NULL);
+            if (gst_buf == NULL) {
+                LOGW("UDP receiver: dropping packet (allocation failed)");
+                continue;
+            }
         }
         GstMapInfo map;
         if (gst_buffer_map(gst_buf, &map, GST_MAP_WRITE)) {
-            memcpy(map.data, buffer, (size_t)n);
+            gsize copy_size = (gsize)n;
+            if (map.size < copy_size) {
+                LOGW("UDP receiver: dropping packet (buffer too small: %" G_GSIZE_FORMAT " < %" G_GSIZE_FORMAT ")", map.size, copy_size);
+                gst_buffer_unmap(gst_buf, &map);
+                gst_buffer_unref(gst_buf);
+                continue;
+            }
+            memcpy(map.data, buffer, (size_t)copy_size);
             gst_buffer_unmap(gst_buf, &map);
+            gst_buffer_set_size(gst_buf, copy_size);
         } else {
             LOGW("UDP receiver: failed to map GstBuffer");
             gst_buffer_unref(gst_buf);
@@ -115,6 +175,8 @@ UdpReceiver *udp_receiver_create(int udp_port, int vid_pt, GstAppSrc *video_apps
     ur->running = FALSE;
     ur->stop_requested = FALSE;
     ur->thread = NULL;
+    ur->pool = NULL;
+    ur->pool_active = FALSE;
 
     return ur;
 }
@@ -218,6 +280,14 @@ void udp_receiver_destroy(UdpReceiver *ur) {
     if (ur->video_appsrc != NULL) {
         gst_object_unref(ur->video_appsrc);
         ur->video_appsrc = NULL;
+    }
+    if (ur->pool != NULL) {
+        if (ur->pool_active) {
+            gst_buffer_pool_set_active(ur->pool, FALSE);
+            ur->pool_active = FALSE;
+        }
+        gst_object_unref(ur->pool);
+        ur->pool = NULL;
     }
     g_mutex_clear(&ur->lock);
     g_free(ur);
