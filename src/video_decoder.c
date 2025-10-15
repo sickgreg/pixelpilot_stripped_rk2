@@ -1,5 +1,6 @@
 #include "video_decoder.h"
 
+#include "drm_fb.h"
 #include "drm_props.h"
 #include "logging.h"
 
@@ -30,6 +31,13 @@
 #include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+
+#ifndef DRM_PLANE_TYPE_PRIMARY
+#define DRM_PLANE_TYPE_PRIMARY 1
+#endif
+#ifndef DRM_PLANE_TYPE_OVERLAY
+#define DRM_PLANE_TYPE_OVERLAY 0
+#endif
 
 #define DECODER_READ_BUF_SIZE (1024 * 1024)
 #define DECODER_MAX_FRAMES 24
@@ -67,6 +75,22 @@ struct VideoDecoder {
     uint32_t prop_src_y;
     uint32_t prop_src_w;
     uint32_t prop_src_h;
+
+    struct DumbFB background_fb;
+    uint32_t background_plane_id;
+    uint32_t background_prop_fb_id;
+    uint32_t background_prop_crtc_id;
+    uint32_t background_prop_crtc_x;
+    uint32_t background_prop_crtc_y;
+    uint32_t background_prop_crtc_w;
+    uint32_t background_prop_crtc_h;
+    uint32_t background_prop_src_x;
+    uint32_t background_prop_src_y;
+    uint32_t background_prop_src_w;
+    uint32_t background_prop_src_h;
+    uint32_t background_prop_zpos;
+    gboolean background_has_zpos;
+    gboolean background_initialized;
 
     MppCtx ctx;
     MppApi *mpi;
@@ -233,6 +257,190 @@ static void set_mpp_decoding_parameters(VideoDecoder *vd) {
     set_control_verbose(vd->mpi, vd->ctx, MPP_DEC_SET_ENABLE_FAST_PLAY, 0xffff);
 }
 
+static int find_crtc_index(int fd, uint32_t crtc_id) {
+    drmModeRes *res = drmModeGetResources(fd);
+    if (!res) {
+        return -1;
+    }
+    int index = -1;
+    for (int i = 0; i < res->count_crtcs; ++i) {
+        if ((uint32_t)res->crtcs[i] == crtc_id) {
+            index = i;
+            break;
+        }
+    }
+    drmModeFreeResources(res);
+    return index;
+}
+
+static gboolean setup_black_background(VideoDecoder *vd) {
+    if (vd->background_initialized) {
+        return TRUE;
+    }
+
+    int crtc_index = find_crtc_index(vd->drm_fd, vd->crtc_id);
+    if (crtc_index < 0) {
+        LOGW("Video decoder: failed to locate CRTC index for background plane");
+        return FALSE;
+    }
+
+    drmModePlaneRes *pres = drmModeGetPlaneResources(vd->drm_fd);
+    if (!pres) {
+        LOGW("Video decoder: drmModeGetPlaneResources failed");
+        return FALSE;
+    }
+
+    uint32_t primary_plane = 0;
+    for (uint32_t i = 0; i < pres->count_planes; ++i) {
+        drmModePlane *plane = drmModeGetPlane(vd->drm_fd, pres->planes[i]);
+        if (!plane) {
+            continue;
+        }
+        gboolean matches_crtc = (plane->possible_crtcs & (1u << crtc_index)) != 0;
+        if (!matches_crtc) {
+            drmModeFreePlane(plane);
+            continue;
+        }
+
+        drmModeObjectProperties *props = drmModeObjectGetProperties(vd->drm_fd, plane->plane_id, DRM_MODE_OBJECT_PLANE);
+        if (!props) {
+            drmModeFreePlane(plane);
+            continue;
+        }
+
+        gboolean is_primary = FALSE;
+        for (uint32_t p = 0; p < props->count_props; ++p) {
+            drmModePropertyRes *prop = drmModeGetProperty(vd->drm_fd, props->props[p]);
+            if (!prop) {
+                continue;
+            }
+            if (strcmp(prop->name, "type") == 0) {
+                if (props->prop_values[p] == DRM_PLANE_TYPE_PRIMARY) {
+                    is_primary = TRUE;
+                }
+                drmModeFreeProperty(prop);
+                break;
+            }
+            drmModeFreeProperty(prop);
+        }
+        drmModeFreeObjectProperties(props);
+
+        if (is_primary) {
+            primary_plane = plane->plane_id;
+            drmModeFreePlane(plane);
+            break;
+        }
+        drmModeFreePlane(plane);
+    }
+    drmModeFreePlaneResources(pres);
+
+    if (primary_plane == 0) {
+        LOGW("Video decoder: no primary plane available for background fill");
+        return FALSE;
+    }
+
+    if (primary_plane == vd->plane_id) {
+        LOGW("Video decoder: configured video plane is primary; skipping background fill");
+        return FALSE;
+    }
+
+    if (create_argb_fb(vd->drm_fd, vd->mode_w, vd->mode_h, 0xFF000000u, &vd->background_fb) != 0) {
+        LOGW("Video decoder: failed to allocate background FB: %s", g_strerror(errno));
+        memset(&vd->background_fb, 0, sizeof(vd->background_fb));
+        return FALSE;
+    }
+
+    if (drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "FB_ID", &vd->background_prop_fb_id) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID", &vd->background_prop_crtc_id) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "CRTC_X", &vd->background_prop_crtc_x) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "CRTC_Y", &vd->background_prop_crtc_y) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "CRTC_W", &vd->background_prop_crtc_w) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "CRTC_H", &vd->background_prop_crtc_h) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "SRC_X", &vd->background_prop_src_x) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "SRC_Y", &vd->background_prop_src_y) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "SRC_W", &vd->background_prop_src_w) != 0 ||
+        drm_get_prop_id(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "SRC_H", &vd->background_prop_src_h) != 0) {
+        LOGW("Video decoder: failed to query background plane properties");
+        destroy_dumb_fb(vd->drm_fd, &vd->background_fb);
+        memset(&vd->background_fb, 0, sizeof(vd->background_fb));
+        return FALSE;
+    }
+
+    uint64_t zmin = 0, zmax = 0;
+    vd->background_has_zpos = (drm_get_prop_id_and_range_ci(vd->drm_fd, primary_plane, DRM_MODE_OBJECT_PLANE, "ZPOS",
+                                                            &vd->background_prop_zpos, &zmin, &zmax, "zpos") == 0);
+
+    drmModeAtomicReq *req = drmModeAtomicAlloc();
+    if (!req) {
+        LOGW("Video decoder: drmModeAtomicAlloc failed for background plane");
+        destroy_dumb_fb(vd->drm_fd, &vd->background_fb);
+        memset(&vd->background_fb, 0, sizeof(vd->background_fb));
+        vd->background_has_zpos = FALSE;
+        return FALSE;
+    }
+
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_fb_id, vd->background_fb.fb_id);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_crtc_id, vd->crtc_id);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_crtc_x, 0);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_crtc_y, 0);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_crtc_w, vd->mode_w);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_crtc_h, vd->mode_h);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_src_x, 0);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_src_y, 0);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_src_w, (uint64_t)vd->mode_w << 16);
+    drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_src_h, (uint64_t)vd->mode_h << 16);
+    if (vd->background_has_zpos) {
+        drmModeAtomicAddProperty(req, primary_plane, vd->background_prop_zpos, zmin);
+    }
+
+    int ret = drmModeAtomicCommit(vd->drm_fd, req, 0, NULL);
+    if (ret != 0 && errno == EBUSY) {
+        ret = drmModeAtomicCommit(vd->drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+    }
+    if (ret != 0) {
+        LOGW("Video decoder: failed to enable background plane: %s", g_strerror(errno));
+        drmModeAtomicFree(req);
+        destroy_dumb_fb(vd->drm_fd, &vd->background_fb);
+        memset(&vd->background_fb, 0, sizeof(vd->background_fb));
+        vd->background_has_zpos = FALSE;
+        return FALSE;
+    }
+
+    drmModeAtomicFree(req);
+
+    vd->background_plane_id = primary_plane;
+    vd->background_initialized = TRUE;
+    return TRUE;
+}
+
+static void teardown_background(VideoDecoder *vd) {
+    if (!vd->background_initialized && vd->background_fb.fb_id == 0) {
+        return;
+    }
+
+    if (vd->background_initialized) {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (req) {
+            drmModeAtomicAddProperty(req, vd->background_plane_id, vd->background_prop_fb_id, 0);
+            drmModeAtomicAddProperty(req, vd->background_plane_id, vd->background_prop_crtc_id, 0);
+            int ret = drmModeAtomicCommit(vd->drm_fd, req, 0, NULL);
+            if (ret != 0) {
+                LOGW("Video decoder: failed to disable background plane: %s", g_strerror(errno));
+            }
+            drmModeAtomicFree(req);
+        }
+    }
+
+    if (vd->background_fb.fb_id != 0) {
+        destroy_dumb_fb(vd->drm_fd, &vd->background_fb);
+        memset(&vd->background_fb, 0, sizeof(vd->background_fb));
+    }
+
+    vd->background_plane_id = 0;
+    vd->background_initialized = FALSE;
+    vd->background_has_zpos = FALSE;
+}
+
 static int commit_plane(VideoDecoder *vd, uint32_t fb_id, uint32_t src_w, uint32_t src_h) {
     drmModeAtomicReq *req = drmModeAtomicAlloc();
     if (!req) {
@@ -250,12 +458,52 @@ static int commit_plane(VideoDecoder *vd, uint32_t fb_id, uint32_t src_w, uint32
         vd->src_h = src_h;
     }
 
+    uint32_t dst_w = vd->mode_w;
+    uint32_t dst_h = vd->mode_h;
+    uint32_t dst_x = 0;
+    uint32_t dst_y = 0;
+
+    if (src_w != 0 && src_h != 0) {
+        double mode_aspect = (double)vd->mode_w / (double)vd->mode_h;
+        double src_aspect = (double)src_w / (double)src_h;
+
+        if (mode_aspect > 0.0 && src_aspect > 0.0) {
+            if (src_aspect > mode_aspect) {
+                dst_w = vd->mode_w;
+                dst_h = (uint32_t)((double)vd->mode_w / src_aspect + 0.5);
+                if (dst_h > vd->mode_h) {
+                    dst_h = vd->mode_h;
+                }
+            } else {
+                dst_h = vd->mode_h;
+                dst_w = (uint32_t)((double)vd->mode_h * src_aspect + 0.5);
+                if (dst_w > vd->mode_w) {
+                    dst_w = vd->mode_w;
+                }
+            }
+        }
+    }
+
+    if (dst_w == 0) {
+        dst_w = 1;
+    }
+    if (dst_h == 0) {
+        dst_h = 1;
+    }
+
+    if (dst_w < vd->mode_w) {
+        dst_x = (vd->mode_w - dst_w) / 2;
+    }
+    if (dst_h < vd->mode_h) {
+        dst_y = (vd->mode_h - dst_h) / 2;
+    }
+
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_fb_id, fb_id);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_id, vd->crtc_id);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_x, 0);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_y, 0);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_w, vd->mode_w);
-    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_h, vd->mode_h);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_x, dst_x);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_y, dst_y);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_w, dst_w);
+    drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_crtc_h, dst_h);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_src_x, 0);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_src_y, 0);
     drmModeAtomicAddProperty(req, vd->plane_id, vd->prop_src_w, (uint64_t)src_w << 16);
@@ -506,6 +754,10 @@ int video_decoder_init(VideoDecoder *vd, const AppCfg *cfg, const ModesetResult 
         return -1;
     }
 
+    if (!setup_black_background(vd)) {
+        LOGW("Video decoder: continuing without background plane");
+    }
+
     if (mpp_create(&vd->ctx, &vd->mpi) != MPP_OK) {
         LOGE("Video decoder: mpp_create failed");
         video_decoder_deinit(vd);
@@ -575,6 +827,8 @@ void video_decoder_deinit(VideoDecoder *vd) {
     vd->mpi = NULL;
 
     release_frame_group(vd);
+
+    teardown_background(vd);
 
     if (vd->packet_buf) {
         g_free(vd->packet_buf);
