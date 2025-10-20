@@ -42,11 +42,12 @@ static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiv
         return NULL;
     }
 
+    // RTP caps (H265) with configured payload type
     GstCaps *caps = gst_caps_new_simple("application/x-rtp",
-                                        "media", G_TYPE_STRING, "video",
-                                        "encoding-name", G_TYPE_STRING, "H265",
-                                        "payload", G_TYPE_INT, cfg->vid_pt,
-                                        "clock-rate", G_TYPE_INT, 90000,
+                                        "media",        G_TYPE_STRING, "video",
+                                        "encoding-name",G_TYPE_STRING, "H265",
+                                        "payload",      G_TYPE_INT,    cfg->vid_pt,
+                                        "clock-rate",   G_TYPE_INT,    90000,
                                         NULL);
     if (caps == NULL) {
         LOGE("Failed to allocate RTP caps for appsrc");
@@ -54,17 +55,22 @@ static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiv
         return NULL;
     }
 
+    // Make appsrc behave like a live RTP source and never back-pressure the UDP thread
     g_object_set(appsrc_elem,
                  "is-live", TRUE,
                  "format", GST_FORMAT_TIME,
                  "stream-type", GST_APP_STREAM_TYPE_STREAM,
                  "do-timestamp", TRUE,
-                 "max-bytes", (guint64)(4 * 1024 * 1024),
+                 "block", FALSE,                               // NEW: never block upstream
+                 "max-bytes", (guint64)0,                      // NEW: unlimited; downstream limits apply
                  NULL);
 
     GstAppSrc *appsrc = GST_APP_SRC(appsrc_elem);
     gst_app_src_set_caps(appsrc, caps);
     gst_caps_unref(caps);
+
+    // NEW: prefer leaking upstream (drop oldest) rather than blocking the producer
+    gst_app_src_set_leaky_type(appsrc, GST_APP_LEAK_TYPE_UPSTREAM);
 
     UdpReceiver *receiver = udp_receiver_create(cfg->udp_port, cfg->vid_pt, appsrc);
     if (receiver == NULL) {
@@ -255,30 +261,39 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
         goto fail;
     }
 
-    GstElement *queue = gst_element_factory_make("queue", "udp_queue");
-    GstElement *depay = gst_element_factory_make("rtph265depay", "video_depay");
-    GstElement *parser = gst_element_factory_make("h265parse", "video_parser");
-    GstElement *capsfilter = gst_element_factory_make("capsfilter", "video_capsfilter");
-    GstElement *appsink = gst_element_factory_make("appsink", "video_sink");
+    GstElement *queue      = gst_element_factory_make("queue",           "udp_queue");
+    GstElement *jitterbuf  = gst_element_factory_make("rtpjitterbuffer", "jitter");   // NEW
+    GstElement *depay      = gst_element_factory_make("rtph265depay",    "video_depay");
+    GstElement *parser     = gst_element_factory_make("h265parse",       "video_parser");
+    GstElement *capsfilter = gst_element_factory_make("capsfilter",      "video_capsfilter");
+    GstElement *appsink    = gst_element_factory_make("appsink",         "video_sink");
 
     CHECK_ELEM(queue, "queue");
+    CHECK_ELEM(jitterbuf, "rtpjitterbuffer");   // NEW
     CHECK_ELEM(depay, "rtph265depay");
     CHECK_ELEM(parser, "h265parse");
     CHECK_ELEM(capsfilter, "capsfilter");
     CHECK_ELEM(appsink, "appsink");
 
-    guint max_buffers = (cfg->appsink_max_buffers > 0) ? (guint)cfg->appsink_max_buffers : 4u;
+    // Appsink should shed load deterministically
+    guint max_buffers = (cfg->appsink_max_buffers > 0) ? (guint)cfg->appsink_max_buffers : 12u; // NEW default
     gst_app_sink_set_max_buffers(GST_APP_SINK(appsink), max_buffers);
     gst_app_sink_set_drop(GST_APP_SINK(appsink), TRUE);
-    g_object_set(appsink, "sync", FALSE, NULL);
+    g_object_set(appsink,
+                 "sync", FALSE,
+                 "emit-signals", FALSE,                          // NEW: we'll pull in our own thread
+                 NULL);
 
-    g_object_set(parser, "config-interval", -1, "disable-passthrough", TRUE, NULL);
-    gst_util_set_object_arg(G_OBJECT(parser), "stream-format", "byte-stream");
-    gst_util_set_object_arg(G_OBJECT(parser), "alignment", "au");
+    // h265parse → repeat headers and avoid passthrough edge cases
+    g_object_set(parser,
+                 "config-interval", -1,
+                 "disable-passthrough", TRUE,
+                 NULL);
 
+    // Enforce Annex-B + AU alignment downstream of parse
     GstCaps *raw_caps = gst_caps_new_simple("video/x-h265",
                                             "stream-format", G_TYPE_STRING, "byte-stream",
-                                            "alignment", G_TYPE_STRING, "au",
+                                            "alignment",     G_TYPE_STRING, "au",
                                             NULL);
     if (raw_caps == NULL) {
         LOGE("Failed to allocate caps for byte-stream enforcement");
@@ -288,15 +303,24 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     gst_app_sink_set_caps(GST_APP_SINK(appsink), raw_caps);
     gst_caps_unref(raw_caps);
 
+    // Front queue: unlimited sizes, upstream leaky (drop oldest) to avoid back-pressure
     g_object_set(queue,
-                 "leaky", 2,
-                 "max-size-time", (guint64)0,
-                 "max-size-bytes", (guint64)0,
-                 "max-size-buffers", 16,
+                 "leaky", 2,                                   // upstream
+                 "max-size-time",   (guint64)0,
+                 "max-size-bytes",  (guint64)0,
+                 "max-size-buffers",(guint)0,
                  NULL);
 
-    gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, depay, parser, capsfilter, appsink, NULL);
-    if (!gst_element_link_many(appsrc, queue, depay, parser, capsfilter, appsink, NULL)) {
+    // Tiny jitterbuffer to absorb burst; keeps low latency
+    g_object_set(jitterbuf,
+                 "latency", 10,           // ms
+                 "do-lost", TRUE,
+                 "drop-on-late", FALSE,
+                 "mode", 2,               // RTP/JB mode "synced"
+                 NULL);
+
+    gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, jitterbuf, depay, parser, capsfilter, appsink, NULL);
+    if (!gst_element_link_many(appsrc, queue, jitterbuf, depay, parser, capsfilter, appsink, NULL)) {
         LOGE("Failed to link UDP pipeline");
         goto fail;
     }
