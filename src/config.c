@@ -34,6 +34,7 @@ static void usage(const char *prog) {
             "  --udp-port N                UDP listen port (default: 5600)\n"
             "  --vid-pt N                  RTP payload type for video (default: 97)\n"
             "  --appsink-max-buffers N     Max buffers queued on the appsink (default: 4)\n"
+            "  --jitter-buffer-ms N        Enable RTP jitterbuffer with N ms latency (0 disables; default 0)\n"
             "  --record-video [PATH]       Enable MP4 recording (optional output path)\n"
             "  --record-mode MODE          MP4 recording mode (standard|sequential|fragmented)\n"
             "  --no-record-video           Disable MP4 recording\n"
@@ -56,6 +57,9 @@ void cfg_defaults(AppCfg *cfg) {
     cfg->vid_pt = 97;
     cfg->appsink_max_buffers = 4;
     cfg->gst_log = 0;
+
+    // NEW: jitterbuffer disabled by default
+    cfg->jitter_buffer_ms = 0;
 
     cfg->record.enable = 0;
     strcpy(cfg->record.output_path, "/media");
@@ -104,6 +108,7 @@ int parse_cli(int argc, char **argv, AppCfg *cfg) {
 
     cfg_defaults(cfg);
 
+    // Early pass to load --config before other flags (so CLI can override file)
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
@@ -122,11 +127,12 @@ int parse_cli(int argc, char **argv, AppCfg *cfg) {
         }
     }
 
+    // Main pass
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
 
         if (strcmp(arg, "--config") == 0) {
-            ++i;
+            ++i; // already handled
             continue;
         } else if (strcmp(arg, "--card") == 0) {
             if (i + 1 >= argc) {
@@ -160,6 +166,18 @@ int parse_cli(int argc, char **argv, AppCfg *cfg) {
                 return -1;
             }
             ++i;
+
+        // NEW: --jitter-buffer-ms (supports --jitter-buffer-ms=NN and --jitter-buffer-ms NN)
+        } else if (strncmp(arg, "--jitter-buffer-ms=", 20) == 0) {
+            int v = atoi(arg + 20);
+            cfg->jitter_buffer_ms = v < 0 ? 0 : v;
+        } else if (strcmp(arg, "--jitter-buffer-ms") == 0) {
+            if (i + 1 >= argc || parse_int_arg("--jitter-buffer-ms", argv[i + 1], &cfg->jitter_buffer_ms) != 0) {
+                return -1;
+            }
+            if (cfg->jitter_buffer_ms < 0) cfg->jitter_buffer_ms = 0;
+            ++i;
+
         } else if (strcmp(arg, "--record-video") == 0) {
             cfg->record.enable = 1;
             if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
@@ -183,6 +201,9 @@ int parse_cli(int argc, char **argv, AppCfg *cfg) {
             cfg->gst_log = 1;
         } else if (strcmp(arg, "--verbose") == 0) {
             log_set_verbose(1);
+        } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            usage(argv[0]);
+            return 1;
         } else {
             LOGE("Unknown option: %s", arg);
             usage(argv[0]);
@@ -200,12 +221,12 @@ typedef struct {
 } RecordModeAlias;
 
 static const RecordModeAlias kRecordModeAliases[] = {
-    {"standard", RECORD_MODE_STANDARD},
-    {"default", RECORD_MODE_STANDARD},
+    {"standard",   RECORD_MODE_STANDARD},
+    {"default",    RECORD_MODE_STANDARD},
     {"sequential", RECORD_MODE_SEQUENTIAL},
-    {"append", RECORD_MODE_SEQUENTIAL},
+    {"append",     RECORD_MODE_SEQUENTIAL},
     {"fragmented", RECORD_MODE_FRAGMENTED},
-    {"fragment", RECORD_MODE_FRAGMENTED},
+    {"fragment",   RECORD_MODE_FRAGMENTED},
 };
 
 int cfg_parse_record_mode(const char *value, RecordMode *mode_out) {
