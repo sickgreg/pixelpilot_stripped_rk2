@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "pipeline.h"
 
 #include "logging.h"
@@ -11,6 +13,9 @@
 #include <gst/gst.h>
 #include <gst/gstutils.h>
 
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 #include <string.h>
 
 #define CHECK_ELEM(elem, name)                                                                      \
@@ -31,6 +36,22 @@ static void ensure_gst_initialized(void) {
     }
 }
 
+/* ---------- Priority helpers ---------- */
+static void boost_thread_priority(int rr_priority, int nice_inc) {
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = rr_priority;
+    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0) {
+        /* Best-effort fallback; ignore errors */
+        if (nice_inc < 0) {
+            int cur = nice(0);
+            (void)cur;
+            nice(nice_inc); /* negative to raise priority */
+        }
+    }
+}
+
+/* ---------- Appsrc (UDP RTP) ---------- */
 static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiver_out) {
     if (cfg == NULL || receiver_out == NULL) {
         return NULL;
@@ -42,7 +63,6 @@ static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiv
         return NULL;
     }
 
-    // RTP caps (H265) with configured payload type
     GstCaps *caps = gst_caps_new_simple("application/x-rtp",
                                         "media",        G_TYPE_STRING, "video",
                                         "encoding-name",G_TYPE_STRING, "H265",
@@ -55,21 +75,18 @@ static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiv
         return NULL;
     }
 
-    // Make appsrc behave like a live RTP source and never back-pressure the UDP thread
     g_object_set(appsrc_elem,
                  "is-live", TRUE,
                  "format", GST_FORMAT_TIME,
                  "stream-type", GST_APP_STREAM_TYPE_STREAM,
                  "do-timestamp", TRUE,
-                 "block", FALSE,                               // NEW: never block upstream
-                 "max-bytes", (guint64)0,                      // NEW: unlimited; downstream limits apply
+                 "block", FALSE,
+                 "max-bytes", (guint64)(4 * 1024 * 1024),
                  NULL);
 
     GstAppSrc *appsrc = GST_APP_SRC(appsrc_elem);
     gst_app_src_set_caps(appsrc, caps);
     gst_caps_unref(caps);
-
-    // NEW: prefer leaking upstream (drop oldest) rather than blocking the producer
 
     UdpReceiver *receiver = udp_receiver_create(cfg->udp_port, cfg->vid_pt, appsrc);
     if (receiver == NULL) {
@@ -82,6 +99,9 @@ static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiv
     return appsrc_elem;
 }
 
+/* ---------- Appsink thread with drop-behind (auto catch-up) ---------- */
+#define CATCHUP_THRESHOLD_MS 300  /* drop frames older than this behind realtime */
+
 static gpointer appsink_thread_func(gpointer data) {
     PipelineState *ps = (PipelineState *)data;
     GstAppSink *appsink = ps->appsink != NULL ? GST_APP_SINK(ps->appsink) : NULL;
@@ -92,6 +112,9 @@ static gpointer appsink_thread_func(gpointer data) {
         return NULL;
     }
 
+    /* Boost priority early: medium-high for pull/dispatch */
+    boost_thread_priority(/*rr_priority*/10, /*nice_inc*/-10);
+
     g_mutex_lock(&ps->lock);
     ps->appsink_thread_running = TRUE;
     g_mutex_unlock(&ps->lock);
@@ -100,6 +123,10 @@ static gpointer appsink_thread_func(gpointer data) {
     if (max_packet == 0) {
         max_packet = 1024 * 1024;
     }
+
+    /* Get pipeline clock once; refresh occasionally if needed */
+    GstClock *pipeline_clock = gst_element_get_clock(ps->pipeline); /* add ref */
+    guint64 last_clock_refresh_ms = 0;
 
     while (TRUE) {
         g_mutex_lock(&ps->lock);
@@ -116,6 +143,47 @@ static gpointer appsink_thread_func(gpointer data) {
             continue;
         }
 
+        /* --- Drop-behind logic (auto catch-up) --- */
+        gboolean drop_sample = FALSE;
+        do {
+            if (!pipeline_clock) break;
+
+            /* Refresh the clock handle ~every 5s (defensive) */
+            guint64 now_ms = (guint64)(g_get_monotonic_time() / 1000);
+            if (now_ms - last_clock_refresh_ms > 5000) {
+                gst_object_unref(pipeline_clock);
+                pipeline_clock = gst_element_get_clock(ps->pipeline);
+                last_clock_refresh_ms = now_ms;
+            }
+            if (!pipeline_clock) break;
+
+            GstBuffer *tmpbuf = gst_sample_get_buffer(sample);
+            if (!tmpbuf) break;
+
+            GstClockTime pts = GST_BUFFER_PTS(tmpbuf);
+            if (!GST_CLOCK_TIME_IS_VALID(pts)) {
+                pts = GST_BUFFER_DTS(tmpbuf);
+            }
+            if (!GST_CLOCK_TIME_IS_VALID(pts)) break;
+
+            GstClockTime now = gst_clock_get_time(pipeline_clock);
+            if (!GST_CLOCK_TIME_IS_VALID(now)) break;
+
+            if (now > pts) {
+                GstClockTime diff = now - pts;
+                if (diff > (GstClockTime)(CATCHUP_THRESHOLD_MS * GST_MSECOND)) {
+                    /* We are too far behind realtime: drop this frame */
+                    drop_sample = TRUE;
+                }
+            }
+        } while (0);
+
+        if (drop_sample) {
+            gst_sample_unref(sample);
+            continue;
+        }
+
+        /* --- Normal path: send to recorder + decoder --- */
         GstBuffer *buffer = gst_sample_get_buffer(sample);
         GstClockTime pts = GST_CLOCK_TIME_NONE;
         if (buffer != NULL) {
@@ -134,6 +202,7 @@ static gpointer appsink_thread_func(gpointer data) {
                     g_mutex_unlock(&ps->recorder_lock);
 
                     if (video_decoder_feed(ps->decoder, map.data, map.size, pts) != 0) {
+                        /* Decoder briefly busy; no spin */
                         LOGV("Video decoder feed busy; retrying");
                     }
                 }
@@ -142,6 +211,10 @@ static gpointer appsink_thread_func(gpointer data) {
         }
 
         gst_sample_unref(sample);
+    }
+
+    if (pipeline_clock) {
+        gst_object_unref(pipeline_clock);
     }
 
     if (ps->decoder != NULL) {
@@ -154,8 +227,13 @@ static gpointer appsink_thread_func(gpointer data) {
     return NULL;
 }
 
+/* ---------- Bus thread (slight priority bump) ---------- */
 static gpointer bus_thread_func(gpointer data) {
     PipelineState *ps = (PipelineState *)data;
+
+    /* Slight bump; not as high as appsink */
+    boost_thread_priority(/*rr_priority*/6, /*nice_inc*/-2);
+
     GstBus *bus = gst_element_get_bus(ps->pipeline);
     if (bus == NULL) {
         LOGE("Pipeline bus unavailable");
@@ -261,35 +339,39 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     }
 
     GstElement *queue      = gst_element_factory_make("queue",           "udp_queue");
-    GstElement *jitterbuf  = gst_element_factory_make("rtpjitterbuffer", "jitter");   // NEW
     GstElement *depay      = gst_element_factory_make("rtph265depay",    "video_depay");
     GstElement *parser     = gst_element_factory_make("h265parse",       "video_parser");
     GstElement *capsfilter = gst_element_factory_make("capsfilter",      "video_capsfilter");
     GstElement *appsink    = gst_element_factory_make("appsink",         "video_sink");
 
+    /* Optional jitterbuffer */
+    GstElement *jitterbuf  = NULL;
+    if (cfg->jitter_buffer_ms > 0) {
+        jitterbuf = gst_element_factory_make("rtpjitterbuffer", "jitter");
+        if (!jitterbuf) {
+            LOGW("rtpjitterbuffer not available; continuing without it");
+        }
+    }
+
     CHECK_ELEM(queue, "queue");
-    CHECK_ELEM(jitterbuf, "rtpjitterbuffer");   // NEW
     CHECK_ELEM(depay, "rtph265depay");
     CHECK_ELEM(parser, "h265parse");
     CHECK_ELEM(capsfilter, "capsfilter");
     CHECK_ELEM(appsink, "appsink");
 
-    // Appsink should shed load deterministically
-    guint max_buffers = (cfg->appsink_max_buffers > 0) ? (guint)cfg->appsink_max_buffers : 12u; // NEW default
+    guint max_buffers = (cfg->appsink_max_buffers > 0) ? (guint)cfg->appsink_max_buffers : 12u;
     gst_app_sink_set_max_buffers(GST_APP_SINK(appsink), max_buffers);
     gst_app_sink_set_drop(GST_APP_SINK(appsink), TRUE);
     g_object_set(appsink,
                  "sync", FALSE,
-                 "emit-signals", FALSE,                          // NEW: we'll pull in our own thread
+                 "emit-signals", FALSE,
                  NULL);
 
-    // h265parse → repeat headers and avoid passthrough edge cases
     g_object_set(parser,
                  "config-interval", -1,
                  "disable-passthrough", TRUE,
                  NULL);
 
-    // Enforce Annex-B + AU alignment downstream of parse
     GstCaps *raw_caps = gst_caps_new_simple("video/x-h265",
                                             "stream-format", G_TYPE_STRING, "byte-stream",
                                             "alignment",     G_TYPE_STRING, "au",
@@ -302,26 +384,35 @@ int pipeline_start(const AppCfg *cfg, const ModesetResult *ms, int drm_fd, Pipel
     gst_app_sink_set_caps(GST_APP_SINK(appsink), raw_caps);
     gst_caps_unref(raw_caps);
 
-    // Front queue: unlimited sizes, upstream leaky (drop oldest) to avoid back-pressure
     g_object_set(queue,
-                 "leaky", 2,                                   // upstream
+                 "leaky", 2,
                  "max-size-time",   (guint64)0,
                  "max-size-bytes",  (guint64)0,
                  "max-size-buffers",(guint)0,
                  NULL);
 
-    // Tiny jitterbuffer to absorb burst; keeps low latency
-    g_object_set(jitterbuf,
-                 "latency", 10,           // ms
-                 "do-lost", TRUE,
-                 "drop-on-late", FALSE,
-                 "mode", 2,               // RTP/JB mode "synced"
-                 NULL);
+    if (jitterbuf && cfg->jitter_buffer_ms > 0) {
+        /* Set only properties supported by this build */
+        GParamSpec *ps_lat = g_object_class_find_property(G_OBJECT_GET_CLASS(jitterbuf), "latency");
+        if (ps_lat) g_object_set(jitterbuf, "latency", cfg->jitter_buffer_ms, NULL);
+        GParamSpec *ps_lost = g_object_class_find_property(G_OBJECT_GET_CLASS(jitterbuf), "do-lost");
+        if (ps_lost) g_object_set(jitterbuf, "do-lost", TRUE, NULL);
+        GParamSpec *ps_mode = g_object_class_find_property(G_OBJECT_GET_CLASS(jitterbuf), "mode");
+        if (ps_mode) g_object_set(jitterbuf, "mode", 2, NULL);
+    }
 
-    gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, jitterbuf, depay, parser, capsfilter, appsink, NULL);
-    if (!gst_element_link_many(appsrc, queue, jitterbuf, depay, parser, capsfilter, appsink, NULL)) {
-        LOGE("Failed to link UDP pipeline");
-        goto fail;
+    if (jitterbuf && cfg->jitter_buffer_ms > 0) {
+        gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, jitterbuf, depay, parser, capsfilter, appsink, NULL);
+        if (!gst_element_link_many(appsrc, queue, jitterbuf, depay, parser, capsfilter, appsink, NULL)) {
+            LOGE("Failed to link pipeline with jitterbuffer");
+            goto fail;
+        }
+    } else {
+        gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, depay, parser, capsfilter, appsink, NULL);
+        if (!gst_element_link_many(appsrc, queue, depay, parser, capsfilter, appsink, NULL)) {
+            LOGE("Failed to link pipeline (no jitterbuffer)");
+            goto fail;
+        }
     }
 
     ps->pipeline = pipeline;
