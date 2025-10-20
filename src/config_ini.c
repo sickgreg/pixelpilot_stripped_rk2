@@ -86,6 +86,17 @@ static int handle_global_key(const char *key, const char *value, AppCfg *cfg) {
     if (strcasecmp(key, "appsink_max_buffers") == 0) {
         return parse_int("appsink_max_buffers", value, &cfg->appsink_max_buffers);
     }
+
+    // NEW: jitter buffer latency in ms (0 = disabled)
+    if (strcasecmp(key, "jitter_buffer_ms") == 0 || strcasecmp(key, "jitter-buffer-ms") == 0) {
+        int v = 0;
+        if (parse_int("jitter_buffer_ms", value, &v) == 0) {
+            cfg->jitter_buffer_ms = (v < 0) ? 0 : v;
+            return 0;
+        }
+        return -1;
+    }
+
     if (strcasecmp(key, "gst_log") == 0) {
         return parse_bool("gst_log", value, &cfg->gst_log);
     }
@@ -115,9 +126,12 @@ static int handle_section_key(const char *section, const char *key, const char *
     if (section == NULL || cfg == NULL) {
         return -1;
     }
-    if (strcasecmp(section, "video") == 0) {
+
+    // Treat [video] and [pipeline] as synonyms for top-level video pipeline keys.
+    if (strcasecmp(section, "video") == 0 || strcasecmp(section, "pipeline") == 0) {
         return handle_global_key(key, value, cfg);
     }
+
     if (strcasecmp(section, "record") == 0) {
         if (strcasecmp(key, "enable") == 0) {
             return parse_bool("record.enable", value, &cfg->record.enable);
@@ -137,6 +151,8 @@ static int handle_section_key(const char *section, const char *key, const char *
         }
         return -1;
     }
+
+    // Fallback to global handler for any other sections.
     return handle_global_key(key, value, cfg);
 }
 
