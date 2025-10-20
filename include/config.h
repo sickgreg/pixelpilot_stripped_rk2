@@ -23,6 +23,7 @@ typedef struct {
 
     int udp_port;
     int vid_pt;
+    int  jitter_buffer_ms;
     int appsink_max_buffers;
     int gst_log;
 
