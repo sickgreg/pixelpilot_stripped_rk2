@@ -70,7 +70,6 @@ static GstElement *create_udp_app_source(const AppCfg *cfg, UdpReceiver **receiv
     gst_caps_unref(caps);
 
     // NEW: prefer leaking upstream (drop oldest) rather than blocking the producer
-    gst_app_src_set_leaky_type(appsrc, GST_APP_LEAK_TYPE_UPSTREAM);
 
     UdpReceiver *receiver = udp_receiver_create(cfg->udp_port, cfg->vid_pt, appsrc);
     if (receiver == NULL) {
