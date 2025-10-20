@@ -13,10 +13,18 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <fcntl.h>
+
+#include <pthread.h>    // thread priority
+#include <sched.h>
+#include <sys/resource.h>
 
 #include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
 
-#define UDP_MAX_PACKET (4 * 1024)
+#define UDP_MAX_PACKET    (4 * 1024)
+#define UDP_RCVBUF_BYTES  (8 * 1024 * 1024)
+#define APPSRC_LEVEL_MAX  (8 * 1024 * 1024)   // drop incoming if appsrc queue above this
 
 struct UdpReceiver {
     int udp_port;
@@ -32,10 +40,19 @@ struct UdpReceiver {
     gboolean pool_active;
 };
 
-static gboolean ensure_buffer_pool(UdpReceiver *ur) {
-    if (ur == NULL) {
-        return FALSE;
+static void set_thread_priority_rr(int rr_prio, int nice_inc) {
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = rr_prio;
+    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0) {
+        if (nice_inc < 0) {
+            setpriority(PRIO_PROCESS, 0, nice_inc);
+        }
     }
+}
+
+static gboolean ensure_buffer_pool(UdpReceiver *ur) {
+    if (ur == NULL) return FALSE;
 
     if (ur->pool != NULL) {
         if (!ur->pool_active) {
@@ -73,18 +90,18 @@ static gboolean ensure_buffer_pool(UdpReceiver *ur) {
 }
 
 static gboolean payload_type_matches(const guint8 *data, gssize len, int expected_pt) {
-    if (expected_pt < 0) {
-        return TRUE;
-    }
-    if (len < 2) {
-        return FALSE;
-    }
+    if (expected_pt < 0) return TRUE;
+    if (len < 2)       return FALSE;
     guint8 payload_type = data[1] & 0x7Fu;
     return payload_type == (guint8)expected_pt;
 }
 
 static gpointer receiver_thread(gpointer data) {
     UdpReceiver *ur = (UdpReceiver *)data;
+
+    // ---- Highest priority among our threads: keep packets flowing ----
+    set_thread_priority_rr(/*rr_prio*/12, /*nice_inc*/-12);
+
     guint8 *buffer = g_malloc(UDP_MAX_PACKET);
     if (buffer == NULL) {
         LOGE("UDP receiver: failed to allocate packet buffer");
@@ -95,25 +112,29 @@ static gpointer receiver_thread(gpointer data) {
         g_mutex_lock(&ur->lock);
         gboolean stop = ur->stop_requested;
         g_mutex_unlock(&ur->lock);
-        if (stop) {
-            break;
-        }
+        if (stop) break;
 
-        ssize_t n = recv(ur->sockfd, buffer, UDP_MAX_PACKET, 0);
+        // Nonblocking recv
+        ssize_t n = recv(ur->sockfd, buffer, UDP_MAX_PACKET, MSG_DONTWAIT);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                g_usleep(1000); // 1 ms to avoid tight spin
                 continue;
             }
             LOGW("UDP receiver: recv failed: %s", g_strerror(errno));
             continue;
         }
-        if (n == 0) {
-            continue;
-        }
-        if (!payload_type_matches(buffer, n, ur->vid_pt)) {
+        if (n == 0) continue;
+        if (!payload_type_matches(buffer, n, ur->vid_pt)) continue;
+
+        // Manual upstream leak: if appsrc is backed up, drop this packet.
+        guint64 level = gst_app_src_get_current_level_bytes(ur->video_appsrc);
+        if (level > APPSRC_LEVEL_MAX) {
+            // Optional verbose: LOGV("Dropping packet, appsrc level=%" G_GUINT64_FORMAT, level);
             continue;
         }
 
+        // Acquire buffer (prefer pool)
         GstBuffer *gst_buf = NULL;
         if (ensure_buffer_pool(ur)) {
             GstFlowReturn acquire_ret = gst_buffer_pool_acquire_buffer(ur->pool, &gst_buf, NULL);
@@ -129,11 +150,14 @@ static gpointer receiver_thread(gpointer data) {
                 continue;
             }
         }
+
+        // Copy payload into buffer
         GstMapInfo map;
         if (gst_buffer_map(gst_buf, &map, GST_MAP_WRITE)) {
             gsize copy_size = (gsize)n;
             if (map.size < copy_size) {
-                LOGW("UDP receiver: dropping packet (buffer too small: %" G_GSIZE_FORMAT " < %" G_GSIZE_FORMAT ")", map.size, copy_size);
+                LOGW("UDP receiver: dropping packet (buffer too small: %" G_GSIZE_FORMAT " < %" G_GSIZE_FORMAT ")",
+                     map.size, copy_size);
                 gst_buffer_unmap(gst_buf, &map);
                 gst_buffer_unref(gst_buf);
                 continue;
@@ -147,9 +171,10 @@ static gpointer receiver_thread(gpointer data) {
             continue;
         }
 
+        // Push
         GstFlowReturn flow = gst_app_src_push_buffer(ur->video_appsrc, gst_buf);
         if (flow != GST_FLOW_OK) {
-            LOGW("UDP receiver: gst_app_src_push_buffer returned %s", gst_flow_get_name(flow));
+            LOGV("UDP receiver: appsrc push returned %s", gst_flow_get_name(flow));
         }
     }
 
@@ -158,14 +183,10 @@ static gpointer receiver_thread(gpointer data) {
 }
 
 UdpReceiver *udp_receiver_create(int udp_port, int vid_pt, GstAppSrc *video_appsrc) {
-    if (video_appsrc == NULL) {
-        return NULL;
-    }
+    if (video_appsrc == NULL) return NULL;
 
     UdpReceiver *ur = g_new0(UdpReceiver, 1);
-    if (ur == NULL) {
-        return NULL;
-    }
+    if (ur == NULL) return NULL;
 
     ur->udp_port = udp_port;
     ur->vid_pt = vid_pt;
@@ -182,9 +203,7 @@ UdpReceiver *udp_receiver_create(int udp_port, int vid_pt, GstAppSrc *video_apps
 }
 
 int udp_receiver_start(UdpReceiver *ur) {
-    if (ur == NULL) {
-        return -1;
-    }
+    if (ur == NULL) return -1;
 
     g_mutex_lock(&ur->lock);
     if (ur->running) {
@@ -205,9 +224,18 @@ int udp_receiver_start(UdpReceiver *ur) {
         LOGW("UDP receiver: setsockopt(SO_REUSEADDR) failed: %s", g_strerror(errno));
     }
 
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        LOGW("UDP receiver: setsockopt(SO_RCVTIMEO) failed: %s", g_strerror(errno));
+    // big receive buffer to tolerate bursts
+    int rcvbuf = UDP_RCVBUF_BYTES;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        LOGW("UDP receiver: setsockopt(SO_RCVBUF) failed: %s", g_strerror(errno));
+    }
+
+    // nonblocking socket
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            LOGW("UDP receiver: fcntl(O_NONBLOCK) failed: %s", g_strerror(errno));
+        }
     }
 
     struct sockaddr_in addr;
@@ -240,9 +268,7 @@ int udp_receiver_start(UdpReceiver *ur) {
 }
 
 void udp_receiver_stop(UdpReceiver *ur) {
-    if (ur == NULL) {
-        return;
-    }
+    if (ur == NULL) return;
 
     g_mutex_lock(&ur->lock);
     if (!ur->running) {
@@ -273,9 +299,7 @@ void udp_receiver_stop(UdpReceiver *ur) {
 }
 
 void udp_receiver_destroy(UdpReceiver *ur) {
-    if (ur == NULL) {
-        return;
-    }
+    if (ur == NULL) return;
     udp_receiver_stop(ur);
     if (ur->video_appsrc != NULL) {
         gst_object_unref(ur->video_appsrc);
