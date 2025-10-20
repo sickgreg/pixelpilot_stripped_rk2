@@ -13,10 +13,13 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <fcntl.h>                 // NEW: O_NONBLOCK
 
 #include <gst/gst.h>
+#include <gst/app/gstappsrc.h>     // NEW: GstAppSrc
 
 #define UDP_MAX_PACKET (4 * 1024)
+#define UDP_RCVBUF_BYTES (8 * 1024 * 1024)   // NEW: big socket buffer
 
 struct UdpReceiver {
     int udp_port;
@@ -55,6 +58,7 @@ static gboolean ensure_buffer_pool(UdpReceiver *ur) {
     }
 
     GstStructure *config = gst_buffer_pool_get_config(pool);
+    // min_buffers=8, max_buffers=32; size per buffer = UDP_MAX_PACKET
     gst_buffer_pool_config_set_params(config, NULL, UDP_MAX_PACKET, 8, 32);
     if (!gst_buffer_pool_set_config(pool, config)) {
         LOGW("UDP receiver: failed to configure buffer pool");
@@ -99,9 +103,13 @@ static gpointer receiver_thread(gpointer data) {
             break;
         }
 
-        ssize_t n = recv(ur->sockfd, buffer, UDP_MAX_PACKET, 0);
+        // Nonblocking recv
+        ssize_t n = recv(ur->sockfd, buffer, UDP_MAX_PACKET, MSG_DONTWAIT);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                // No packet right now; yield a tiny bit to avoid busy spinning
+                // (low enough not to add meaningful latency)
+                g_usleep(1000); // 1 ms
                 continue;
             }
             LOGW("UDP receiver: recv failed: %s", g_strerror(errno));
@@ -114,6 +122,7 @@ static gpointer receiver_thread(gpointer data) {
             continue;
         }
 
+        // Acquire buffer (prefer pool)
         GstBuffer *gst_buf = NULL;
         if (ensure_buffer_pool(ur)) {
             GstFlowReturn acquire_ret = gst_buffer_pool_acquire_buffer(ur->pool, &gst_buf, NULL);
@@ -129,11 +138,14 @@ static gpointer receiver_thread(gpointer data) {
                 continue;
             }
         }
+
+        // Copy payload into buffer
         GstMapInfo map;
         if (gst_buffer_map(gst_buf, &map, GST_MAP_WRITE)) {
             gsize copy_size = (gsize)n;
             if (map.size < copy_size) {
-                LOGW("UDP receiver: dropping packet (buffer too small: %" G_GSIZE_FORMAT " < %" G_GSIZE_FORMAT ")", map.size, copy_size);
+                LOGW("UDP receiver: dropping packet (buffer too small: %" G_GSIZE_FORMAT " < %" G_GSIZE_FORMAT ")",
+                     map.size, copy_size);
                 gst_buffer_unmap(gst_buf, &map);
                 gst_buffer_unref(gst_buf);
                 continue;
@@ -147,9 +159,13 @@ static gpointer receiver_thread(gpointer data) {
             continue;
         }
 
-        GstFlowReturn flow = gst_app_src_push_buffer(ur->video_appsrc, gst_buf);
+        // IMPORTANT: push with upstream leak type so producer never blocks.
+        // Ownership of gst_buf transfers to appsrc regardless of return.
+        GstFlowReturn flow = gst_app_src_push_buffer_full(ur->video_appsrc, gst_buf, GST_APP_LEAK_TYPE_UPSTREAM);
         if (flow != GST_FLOW_OK) {
-            LOGW("UDP receiver: gst_app_src_push_buffer returned %s", gst_flow_get_name(flow));
+            // Do not retry or block; we intentionally keep the receiver hot.
+            // gst_buf is owned by appsrc now (even on failure).
+            LOGV("UDP receiver: appsrc push returned %s", gst_flow_get_name(flow));
         }
     }
 
@@ -205,10 +221,21 @@ int udp_receiver_start(UdpReceiver *ur) {
         LOGW("UDP receiver: setsockopt(SO_REUSEADDR) failed: %s", g_strerror(errno));
     }
 
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        LOGW("UDP receiver: setsockopt(SO_RCVTIMEO) failed: %s", g_strerror(errno));
+    // NEW: big receive buffer to tolerate bursts
+    int rcvbuf = UDP_RCVBUF_BYTES;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        LOGW("UDP receiver: setsockopt(SO_RCVBUF) failed: %s", g_strerror(errno));
     }
+
+    // NEW: nonblocking socket; we poll with MSG_DONTWAIT in the thread
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            LOGW("UDP receiver: fcntl(O_NONBLOCK) failed: %s", g_strerror(errno));
+        }
+    }
+
+    // Remove SO_RCVTIMEO (we're nonblocking now); if present, it won’t hurt, but not needed.
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
